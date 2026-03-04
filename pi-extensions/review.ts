@@ -4,6 +4,7 @@
  * Provides a `/review` command that prompts the agent to review code changes.
  * Supports multiple review modes:
  * - Review a GitHub pull request (checks out the PR locally)
+ * - Review an Azure DevOps pull request (fetched via `az repos pr show`)
  * - Review against a base branch (PR style)
  * - Review uncommitted changes
  * - Review a specific commit
@@ -13,6 +14,8 @@
  * - `/review` - show interactive selector
  * - `/review pr 123` - review PR #123 (checks out locally)
  * - `/review pr https://github.com/owner/repo/pull/123` - review PR from URL
+ * - `/review ado-pr https://dev.azure.com/myorg/myproject/_git/myrepo/pullrequest/123` - review ADO PR
+ * - `/review ado-pr 123` - review ADO PR by ID (uses repo default org/project)
  * - `/review uncommitted` - review uncommitted changes directly
  * - `/review branch main` - review against main branch
  * - `/review commit abc123` - review specific commit
@@ -93,7 +96,8 @@ type ReviewTarget =
 	| { type: "baseBranch"; branch: string }
 	| { type: "commit"; sha: string; title?: string }
 	| { type: "custom"; instructions: string }
-	| { type: "pullRequest"; prNumber: number; baseBranch: string; title: string };
+	| { type: "pullRequest"; prNumber: number; baseBranch: string; title: string }
+	| { type: "adoPullRequest"; prId: number; org: string; project: string; repoId: string; title: string; description: string };
 
 // Prompts (adapted from Codex)
 const UNCOMMITTED_PROMPT =
@@ -115,6 +119,31 @@ const PULL_REQUEST_PROMPT =
 
 const PULL_REQUEST_PROMPT_FALLBACK =
 	'Review pull request #{prNumber} ("{title}") against the base branch \'{baseBranch}\'. Start by finding the merge base between the current branch and {baseBranch} (e.g., `git merge-base HEAD {baseBranch}`), then run `git diff` against that SHA to see the changes that would be merged. Provide prioritized, actionable findings.';
+
+const ADO_PULL_REQUEST_PROMPT =
+	`Review Azure DevOps pull request #{prId} ("{title}").
+
+Fetch the changed files and their diffs using the Azure DevOps CLI, for example:
+
+\`\`\`bash
+# Get PR details
+az repos pr show --id {prId} --org {org} -o json
+
+# Get changed files
+az devops invoke --area git --resource pullRequestIterationChanges \\
+  --route-parameters project={project} repositoryId={repoId} pullRequestId={prId} iterationId=1 \\
+  --org {org} -o json
+
+# Get file content at a given commit
+TOKEN=$(az account get-access-token --query accessToken -o tsv)
+curl -s -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" \\
+  "{org}/{project}/_apis/git/repositories/{repoId}/blobs/<objectId>?api-version=7.1&\\$format=text"
+\`\`\`
+
+PR description:
+{description}
+
+Provide prioritized, actionable findings.`;
 
 // The detailed review rubric (adapted from Codex's review_prompt.md)
 const REVIEW_RUBRIC = `# Review Guidelines
@@ -319,6 +348,96 @@ function parsePrReference(ref: string): number | null {
 	return null;
 }
 
+type AdoPrRef = {
+	prId: number;
+	org: string;
+	project: string;
+	repo: string;
+};
+
+/**
+ * Parse an ADO PR URL or bare PR ID.
+ * Supported URL format:
+ *   https://<org>.visualstudio.com/<project>/_git/<repo>/pullrequest/<id>
+ *   https://dev.azure.com/<org>/<project>/_git/<repo>/pullrequest/<id>
+ * Bare number: just the PR ID (returns null for org/project/repo — caller supplies defaults).
+ */
+function parseAdoPrReference(ref: string): AdoPrRef | number | null {
+	const trimmed = ref.trim();
+
+	// Bare number
+	const num = parseInt(trimmed, 10);
+	if (!isNaN(num) && num > 0 && /^\d+$/.test(trimmed)) {
+		return num;
+	}
+
+	// visualstudio.com URL: https://<org>.visualstudio.com/[<collection>/]<project>/_git/<repo>/pullrequest/<id>
+	const vstsMatch = trimmed.match(
+		/https?:\/\/([^.]+)\.visualstudio\.com\/(?:[^/]+\/)?([^/]+)\/_git\/([^/]+)\/pullrequest\/(\d+)/i,
+	);
+	if (vstsMatch) {
+		return {
+			prId: parseInt(vstsMatch[4], 10),
+			org: `https://${vstsMatch[1]}.visualstudio.com`,
+			project: decodeURIComponent(vstsMatch[2]),
+			repo: decodeURIComponent(vstsMatch[3]),
+		};
+	}
+
+	// dev.azure.com URL: https://dev.azure.com/<org>/<project>/_git/<repo>/pullrequest/<id>
+	const devAzureMatch = trimmed.match(
+		/https?:\/\/dev\.azure\.com\/([^/]+)\/([^/]+)\/_git\/([^/]+)\/pullrequest\/(\d+)/i,
+	);
+	if (devAzureMatch) {
+		return {
+			prId: parseInt(devAzureMatch[4], 10),
+			org: `https://dev.azure.com/${devAzureMatch[1]}`,
+			project: decodeURIComponent(devAzureMatch[2]),
+			repo: decodeURIComponent(devAzureMatch[3]),
+		};
+	}
+
+	return null;
+}
+
+type AdoPrInfo = {
+	prId: number;
+	title: string;
+	description: string;
+	repoId: string;
+};
+
+/**
+ * Fetch PR info from Azure DevOps using `az repos pr show`.
+ */
+async function getAdoPrInfo(
+	pi: ExtensionAPI,
+	prId: number,
+	org: string,
+	project: string,
+): Promise<AdoPrInfo | null> {
+	const { stdout, code } = await pi.exec("az", [
+		"repos", "pr", "show",
+		"--id", String(prId),
+		"--org", org,
+		"-o", "json",
+	]);
+
+	if (code !== 0) return null;
+
+	try {
+		const data = JSON.parse(stdout);
+		return {
+			prId,
+			title: data.title ?? `PR #${prId}`,
+			description: (data.description ?? "").slice(0, 2000),
+			repoId: data.repository?.id ?? data.repository?.name ?? "",
+		};
+	} catch {
+		return null;
+	}
+}
+
 /**
  * Get PR information from GitHub CLI
  */
@@ -426,6 +545,15 @@ async function buildReviewPrompt(pi: ExtensionAPI, target: ReviewTarget): Promis
 				.replace(/{title}/g, target.title)
 				.replace(/{baseBranch}/g, target.baseBranch);
 		}
+
+		case "adoPullRequest":
+			return ADO_PULL_REQUEST_PROMPT
+				.replace(/{prId}/g, String(target.prId))
+				.replace(/{title}/g, target.title)
+				.replace(/{org}/g, target.org)
+				.replace(/{project}/g, target.project)
+				.replace(/{repoId}/g, target.repoId)
+				.replace(/{description}/g, target.description || "(no description provided)");
 	}
 }
 
@@ -449,12 +577,18 @@ function getUserFacingHint(target: ReviewTarget): string {
 			const shortTitle = target.title.length > 30 ? target.title.slice(0, 27) + "..." : target.title;
 			return `PR #${target.prNumber}: ${shortTitle}`;
 		}
+
+		case "adoPullRequest": {
+			const shortTitle = target.title.length > 30 ? target.title.slice(0, 27) + "..." : target.title;
+			return `ADO PR #${target.prId}: ${shortTitle}`;
+		}
 	}
 }
 
 // Review preset options for the selector
 const REVIEW_PRESETS = [
 	{ value: "pullRequest", label: "Review a pull request", description: "(GitHub PR)" },
+	{ value: "adoPullRequest", label: "Review an Azure DevOps pull request", description: "(ADO PR)" },
 	{ value: "baseBranch", label: "Review against a base branch", description: "(local)" },
 	{ value: "uncommitted", label: "Review uncommitted changes", description: "" },
 	{ value: "commit", label: "Review a commit", description: "" },
@@ -576,6 +710,12 @@ export default function reviewExtension(pi: ExtensionAPI) {
 
 				case "pullRequest": {
 					const target = await showPrInput(ctx);
+					if (target) return target;
+					break;
+				}
+
+				case "adoPullRequest": {
+					const target = await showAdoPrInput(ctx);
 					if (target) return target;
 					break;
 				}
@@ -789,6 +929,66 @@ export default function reviewExtension(pi: ExtensionAPI) {
 	}
 
 	/**
+	 * Show ADO PR input and fetch PR info via `az repos pr show`.
+	 * Does NOT check out anything locally — the agent fetches diffs via az/curl.
+	 */
+	async function showAdoPrInput(ctx: ExtensionContext): Promise<ReviewTarget | null> {
+		const prRef = await ctx.ui.editor(
+			"Enter ADO PR URL or ID (e.g. https://dev.azure.com/myorg/myproject/_git/myrepo/pullrequest/123):",
+			"",
+		);
+
+		if (!prRef?.trim()) return null;
+
+		const parsed = parseAdoPrReference(prRef.trim());
+		if (!parsed) {
+			ctx.ui.notify("Invalid ADO PR reference. Enter a full URL or a bare PR ID.", "error");
+			return null;
+		}
+
+		let prId: number;
+		let org: string;
+		let project: string;
+		let repo: string;
+
+		if (typeof parsed === "number") {
+			// Bare ID — ask for org/project/repo
+			prId = parsed;
+			const orgInput = await ctx.ui.editor("Enter ADO org URL (e.g. https://dev.azure.com/myorg):", "");
+			if (!orgInput?.trim()) return null;
+			org = orgInput.trim();
+
+			const projectInput = await ctx.ui.editor("Enter ADO project:", "");
+			if (!projectInput?.trim()) return null;
+			project = projectInput.trim();
+
+			const repoInput = await ctx.ui.editor("Enter repository name:", "");
+			if (!repoInput?.trim()) return null;
+			repo = repoInput.trim();
+		} else {
+			({ prId, org, project, repo } = parsed);
+		}
+
+		ctx.ui.notify(`Fetching ADO PR #${prId} info...`, "info");
+		const prInfo = await getAdoPrInfo(pi, prId, org, project);
+
+		if (!prInfo) {
+			ctx.ui.notify(`Could not fetch ADO PR #${prId}. Make sure \`az\` is authenticated (run \`az login\`).`, "error");
+			return null;
+		}
+
+		return {
+			type: "adoPullRequest",
+			prId,
+			org,
+			project,
+			repoId: prInfo.repoId || repo,
+			title: prInfo.title,
+			description: prInfo.description,
+		};
+	}
+
+	/**
 	 * Execute the review
 	 */
 	async function executeReview(ctx: ExtensionCommandContext, target: ReviewTarget, useFreshSession: boolean): Promise<void> {
@@ -871,9 +1071,9 @@ export default function reviewExtension(pi: ExtensionAPI) {
 
 	/**
 	 * Parse command arguments for direct invocation
-	 * Returns the target or a special marker for PR that needs async handling
+	 * Returns the target or a special marker for PR/ADO-PR that needs async handling
 	 */
-	function parseArgs(args: string | undefined): ReviewTarget | { type: "pr"; ref: string } | null {
+	function parseArgs(args: string | undefined): ReviewTarget | { type: "pr"; ref: string } | { type: "ado-pr"; ref: string } | null {
 		if (!args?.trim()) return null;
 
 		const parts = args.trim().split(/\s+/);
@@ -906,6 +1106,13 @@ export default function reviewExtension(pi: ExtensionAPI) {
 				const ref = parts[1];
 				if (!ref) return null;
 				return { type: "pr", ref };
+			}
+
+			case "ado-pr": {
+				// Support both bare ID and full URL (URL may contain slashes, so join remaining parts)
+				const ref = parts.slice(1).join(" ");
+				if (!ref) return null;
+				return { type: "ado-pr", ref };
 			}
 
 			default:
@@ -990,6 +1197,40 @@ export default function reviewExtension(pi: ExtensionAPI) {
 					target = await handlePrCheckout(ctx, parsed.ref);
 					if (!target) {
 						ctx.ui.notify("PR review failed. Returning to review menu.", "warning");
+					}
+				} else if (parsed.type === "ado-pr") {
+					// Handle ADO PR — fetch via az, no local checkout needed
+					const adoParsed = parseAdoPrReference(parsed.ref);
+					if (!adoParsed) {
+						ctx.ui.notify("Invalid ADO PR reference. Use a full URL or bare PR ID.", "error");
+					} else {
+						let prId: number;
+						let org: string;
+						let project: string;
+						let repo: string;
+
+						if (typeof adoParsed === "number") {
+							// Bare ID — fall through to selector for org/project/repo
+							ctx.ui.notify("Bare ADO PR ID given without org/project — use the selector to fill in details.", "info");
+							fromSelector = true;
+						} else {
+							({ prId, org, project, repo } = adoParsed);
+							ctx.ui.notify(`Fetching ADO PR #${prId} info...`, "info");
+							const prInfo = await getAdoPrInfo(pi, prId, org, project);
+							if (!prInfo) {
+								ctx.ui.notify(`Could not fetch ADO PR #${prId}. Make sure \`az\` is authenticated.`, "error");
+							} else {
+								target = {
+									type: "adoPullRequest",
+									prId,
+									org,
+									project,
+									repoId: prInfo.repoId || repo,
+									title: prInfo.title,
+									description: prInfo.description,
+								};
+							}
+						}
 					}
 				} else {
 					target = parsed;

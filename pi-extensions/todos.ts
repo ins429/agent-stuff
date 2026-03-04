@@ -1,3 +1,5 @@
+// @upstream https://github.com/mitsuhiko/agent-stuff/blob/main/pi-extensions/todos.ts
+
 /**
  * This extension stores todo items as files under <todo-dir> (defaults to .pi/todos,
  * or the path in PI_TODO_PATH).  Each todo is a standalone markdown file named

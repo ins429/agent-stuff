@@ -1,3 +1,5 @@
+// @upstream https://github.com/mitsuhiko/agent-stuff/blob/main/pi-extensions/loop.ts
+
 /**
  * Loop Extension
  *

@@ -1,3 +1,5 @@
+// @upstream https://github.com/mitsuhiko/agent-stuff/blob/main/pi-extensions/notify.ts
+
 /**
  * Desktop Notification Extension
  *

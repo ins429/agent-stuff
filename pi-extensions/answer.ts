@@ -1,3 +1,5 @@
+// @upstream https://github.com/mitsuhiko/agent-stuff/blob/main/pi-extensions/answer.ts
+
 /**
  * Q&A extraction hook - extracts questions from assistant responses
  *

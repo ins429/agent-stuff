@@ -1,3 +1,5 @@
+// @upstream https://github.com/mitsuhiko/agent-stuff/blob/main/pi-extensions/whimsical.ts
+
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
 const messages = [
@@ -241,7 +243,7 @@ const messages = [
   "Tangling...",
   "Jangling...",
   "Angling...",
-  "Strangling...",
+  "Struggling...",
   "Mingling...",
   "Tingling...",
   "Jingling...",
