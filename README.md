@@ -2,7 +2,7 @@
 
 A [pi package](https://github.com/badlogic/pi-mono) containing skills, extensions, themes, and prompt commands for the pi coding agent.
 
-Originally inspired by [`mitsupi`](https://github.com/mitsuhiko/agent-stuff).
+Originally inspired by [`mitsupi`](https://github.com/mitsuhiko/agent-stuff) and many stuff copied from it.
 
 ## Skills
 
